@@ -1,0 +1,109 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<mule xmlns:dw="http://www.mulesoft.org/schema/mule/ee/dw" xmlns:ws="http://www.mulesoft.org/schema/mule/ws" xmlns:metadata="http://www.mulesoft.org/schema/mule/metadata" xmlns:http="http://www.mulesoft.org/schema/mule/http" xmlns:tracking="http://www.mulesoft.org/schema/mule/ee/tracking" xmlns="http://www.mulesoft.org/schema/mule/core" xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:spring="http://www.springframework.org/schema/beans" 
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://www.springframework.org/schema/beans http://www.springframework.org/schema/beans/spring-beans-current.xsd
+http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+http://www.mulesoft.org/schema/mule/ee/tracking http://www.mulesoft.org/schema/mule/ee/tracking/current/mule-tracking-ee.xsd
+http://www.mulesoft.org/schema/mule/ws http://www.mulesoft.org/schema/mule/ws/current/mule-ws.xsd
+http://www.mulesoft.org/schema/mule/ee/dw http://www.mulesoft.org/schema/mule/ee/dw/current/dw.xsd">
+    <sub-flow name="optionalParamsFlow">
+        <set-variable variableName="country" value="#[message.inboundProperties.'http.query.params'.country == empty? empty : message.inboundProperties.'http.query.params'.country]" doc:name="setCountryVariable"/>
+        <set-variable variableName="name" value="#[message.inboundProperties.'http.query.params'.name == empty? empty : message.inboundProperties.'http.query.params'.name]" doc:name="setNameVariable"/>
+    </sub-flow>
+    <flow name="accounts-trans-orchestrationFlow">
+        <http:listener config-ref="HTTP_Listener_Configuration" path="/accounts" allowedMethods="GET" doc:name="HTTP"/>
+        <flow-ref name="getAccountsFlow" doc:name="getAccountsFlow"/>
+        <http:request config-ref="TransferAccount_HTTP_Request_Configuration" path="/accounts_transactions" method="POST" doc:name="Transfer Accounts POST Request"/>
+        <dw:transform-message doc:name="Transform Message">
+            <dw:set-payload><![CDATA[%dw 1.0
+%output application/java
+---
+{
+	message: "Processed $(sizeOf flowVars.accountsData) records."
+}]]></dw:set-payload>
+        </dw:transform-message>
+        <logger level="INFO" doc:name="Logger"/>
+    </flow>
+    <sub-flow name="getAccountsFlow">
+        <flow-ref name="optionalParamsFlow" doc:name="optionalParamsFlow"/>
+        <http:request config-ref="Accounts_HTTP_Request_Configuration" path="/accounts" method="GET" doc:name="Accounts REST API">
+            <http:request-builder>
+                <http:query-param paramName="country" value="#[flowVars.country]"/>
+                <http:query-param paramName="type" value="#[message.inboundProperties.'http.query.params'.type]"/>
+                <http:query-param paramName="name" value="#[flowVars.name]"/>
+                <http:header headerName="Requester-ID" value="${Requester-ID}"/>
+            </http:request-builder>
+        </http:request>
+        <set-variable variableName="accountsData" value="#[message.payloadAs(java.lang.String)]" doc:name="accountsDataVariable"/>
+        <dw:transform-message doc:name="Extract CustomerIDs Transform" metadata:id="f683704a-b5ec-4bcd-9a1b-4e9d2b410a2f">
+            <dw:input-payload mimeType="application/json"/>
+            <dw:set-payload><![CDATA[%dw 1.0
+%output application/json
+---
+{
+	customerIDs: payload.*id default []
+}]]></dw:set-payload>
+        </dw:transform-message>
+        <flow-ref name="getTransactionsFlow" doc:name="getTransactionsFlow"/>
+    </sub-flow>
+
+    <sub-flow name="getTransactionsFlow">
+        <dw:transform-message doc:name="Transform JSON to XML Envelope">
+            <dw:set-payload><![CDATA[%dw 1.0
+%output application/xml
+%namespace ns0 http://training.mulesoft.com/
+---
+{
+	ns0#GetTransactionsforCustomers: {
+		(payload.customerIDs map ((customerID , indexOfCustomerID) -> {
+			customerID: customerID
+		}))
+	}
+}]]></dw:set-payload>
+        </dw:transform-message>
+
+
+        <ws:consumer config-ref="Transactions_Web_Service_Consumer" operation="GetTransactionsforCustomers" doc:name="Transactions SOAP API"/>
+        <dw:transform-message doc:name="Combine Accounts and Transactions" metadata:id="28844e66-7eed-41ae-b82a-79bc539982cc">
+            <dw:input-variable mimeType="application/json" variableName="accountsData"/>
+            <dw:set-payload><![CDATA[%dw 1.0
+%output application/json
+%namespace ns0 http://training.mulesoft.com/
+---
+{
+	accounts: flowVars.accountsData,
+	transactions: payload.ns0#GetTransactionsforCustomersResponse.*transaction
+}]]></dw:set-payload>
+        </dw:transform-message>
+        <dw:transform-message doc:name="Normalize">
+            <dw:set-payload><![CDATA[%dw 1.0
+%output application/java
+
+%var directorIDs = ["JKLS483S","FJSA48JD","NMA4FJ9K"]
+
+//Combines Accounts and Transactions by the Account ID. Assigns each account to a
+//director
+%function consolidateAccountsTrans (payload)
+  payload.accounts map ( (account, index) ->
+  using (id = account.id as :string)
+  (
+    account ++
+    {
+      transactions: payload.transactions filter ($.customerRef == id)
+    } ++
+    {
+      assignedDirector: directorIDs[index mod sizeOf directorIDs]
+    }
+  )
+)
+---
+using (data = consolidateAccountsTrans(payload))
+(data groupBy $.assignedDirector)
+]]></dw:set-payload>
+        </dw:transform-message>
+
+    </sub-flow>
+</mule>
